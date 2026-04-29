@@ -197,6 +197,172 @@ def get_routed_length_mm(board, net_code):
 _API_PROBE_DONE = [False]
 
 
+_STACKUP_PROBE_DONE = [False]
+
+
+def _build_layer_depths(board):
+    """Return {copper_layer_id: depth_in_iu}, where depth is measured
+    from the top of the board.
+
+    Tries (in order):
+      1. BOARD_STACKUP_DESCRIPTOR with proper item enumeration — gives
+         the exact dielectric thicknesses.
+      2. Uniform-thickness fallback: divides total board thickness
+         equally across (copper_layers − 1) dielectric gaps, mapping
+         KiCad layer IDs (F.Cu=0, In1..In(N-2)=1..N-2, B.Cu=31) to
+         positions 0..N-1.
+    """
+    if not _STACKUP_PROBE_DONE[0]:
+        _STACKUP_PROBE_DONE[0] = True
+        _probe_stackup_api(board)
+
+    # ---- Attempt 1: full stackup descriptor walk --------------------
+    depths = _try_stackup_walk(board)
+    if depths:
+        return depths
+
+    # ---- Attempt 2: uniform-thickness fallback ----------------------
+    return _uniform_stackup_depths(board)
+
+
+def _try_stackup_walk(board):
+    depths = {}
+    try:
+        stackup = board.GetDesignSettings().GetStackupDescriptor()
+    except Exception:
+        return depths
+
+    # Probe a list of methods to enumerate the stackup items, since the
+    # name varies between KiCad SWIG builds.
+    items = None
+    for fn_name in ("GetList", "GetItems", "GetStackupItems", "GetStackup"):
+        fn = getattr(stackup, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            r = fn()
+            if r:
+                items = list(r)
+                break
+        except Exception:
+            continue
+    if items is None:
+        # Some builds let you index directly: stackup[i] for i in range(n).
+        try:
+            n = stackup.GetCount()
+            items = [stackup.GetItem(i) for i in range(n)]
+        except Exception:
+            pass
+    if not items:
+        return depths
+
+    copper_t     = getattr(pcbnew, "BS_ITEM_TYPE_COPPER",     None)
+    dielectric_t = getattr(pcbnew, "BS_ITEM_TYPE_DIELECTRIC", None)
+
+    cumulative = 0
+    for it in items:
+        try:
+            t_type = it.GetType()
+        except Exception:
+            continue
+        try:
+            thickness = it.GetThickness() or 0
+        except Exception:
+            thickness = 0
+
+        if copper_t is not None and t_type == copper_t:
+            try:
+                lid = it.GetBrdLayerId()
+            except Exception:
+                lid = None
+            if lid is not None and lid >= 0:
+                depths[lid] = cumulative
+        elif dielectric_t is not None and t_type == dielectric_t:
+            cumulative += thickness
+    return depths
+
+
+def _uniform_stackup_depths(board):
+    """Approximation when the stackup descriptor isn't enumerable: map
+    layer IDs to evenly-spaced depths across the board thickness."""
+    try:
+        thickness = board.GetDesignSettings().GetBoardThickness() or 0
+    except Exception:
+        thickness = 0
+    if thickness <= 0:
+        thickness = 1600000  # 1.6 mm fallback
+
+    try:
+        n_copper = board.GetCopperLayerCount() or 0
+    except Exception:
+        n_copper = 0
+    if n_copper < 2:
+        n_copper = 2
+
+    # KiCad layer IDs: F.Cu=0, In1..In(n_copper-2)=1..(n_copper-2),
+    # B.Cu=31. Map each to a position 0..n_copper-1.
+    layer_ids = [0]
+    for i in range(1, n_copper - 1):
+        layer_ids.append(i)
+    layer_ids.append(31)  # B.Cu
+
+    per_step = thickness / (n_copper - 1)
+    depths = {}
+    for pos, lid in enumerate(layer_ids):
+        depths[lid] = pos * per_step
+    return depths
+
+
+def _probe_stackup_api(board):
+    """One-shot diagnostic dumping what's accessible on the stackup
+    descriptor + the board's copper-layer count."""
+    try:
+        ds = board.GetDesignSettings()
+    except Exception as ex:
+        _llog("STACKUP PROBE: GetDesignSettings exc: {}".format(ex))
+        return
+
+    try:
+        thickness = ds.GetBoardThickness()
+    except Exception:
+        thickness = "?"
+    try:
+        n_copper = board.GetCopperLayerCount()
+    except Exception:
+        n_copper = "?"
+    _llog("STACKUP PROBE: BoardThickness={}  CopperLayerCount={}"
+          .format(thickness, n_copper))
+
+    try:
+        stackup = ds.GetStackupDescriptor()
+    except Exception as ex:
+        _llog("STACKUP PROBE: GetStackupDescriptor exc: {}".format(ex))
+        return
+
+    # What methods does the stackup descriptor expose?
+    try:
+        attrs = sorted(m for m in dir(stackup) if not m.startswith("_"))
+    except Exception:
+        attrs = []
+    _llog("STACKUP PROBE: dir(stackup) = " + ", ".join(attrs))
+
+    # Try various enumeration methods
+    for fn_name in ("GetList", "GetItems", "GetStackupItems", "GetStackup",
+                    "GetCount"):
+        fn = getattr(stackup, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            r = fn()
+            try:
+                rlen = len(list(r)) if hasattr(r, "__iter__") else r
+            except Exception:
+                rlen = "?"
+            _llog("STACKUP PROBE: {}() -> {}".format(fn_name, rlen))
+        except Exception as ex:
+            _llog("STACKUP PROBE: {}() exc {}".format(fn_name, ex))
+
+
 def _probe_connectivity_api(connectivity, sample_item, type_filter):
     """Log what connectivity methods are available and which neighbour-
     enumeration call shape actually returns results. Runs once per
@@ -271,9 +437,12 @@ def _length_via_connectivity(board, net_code, pads, items):
     sample = items[0] if items else (pads[0] if pads else None)
     _probe_connectivity_api(connectivity, sample, type_filter)
 
-    # Cache board thickness for via length fallback. KiCad 9's SWIG build
-    # appears to return 0 from PCB_VIA.GetLength(), so we synthesize the
-    # via barrel length from the board stackup as a fallback.
+    # Cache board thickness + layer-depth map for via length fallback.
+    # KiCad 9's SWIG build appears to return 0 from PCB_VIA.GetLength(),
+    # so we synthesize the barrel length from the BOARD_STACKUP. For
+    # partial-span (blind/buried) vias the depth difference between the
+    # via's top and bottom copper layers is the right answer; full
+    # through-vias span the entire stackup.
     _board_thickness = 0
     try:
         _board_thickness = board.GetDesignSettings().GetBoardThickness()
@@ -281,6 +450,8 @@ def _length_via_connectivity(board, net_code, pads, items):
         pass
     if not _board_thickness or _board_thickness <= 0:
         _board_thickness = 1600000  # 1.6 mm in nm (typical 4-layer)
+
+    _layer_depths = _build_layer_depths(board)
 
     def _w(item):
         try:
@@ -293,17 +464,56 @@ def _length_via_connectivity(board, net_code, pads, items):
             except Exception:
                 return 0
         if cls == "PCB_VIA":
+            # Try the direct API first (works on some KiCad builds).
             try:
                 l = item.GetLength()
                 if l and l > 0:
                     return l
             except Exception:
                 pass
-            # GetLength() returned 0 — use full board thickness as the
-            # via barrel length. KiCad layer IDs aren't contiguous (F.Cu=0,
-            # B.Cu=31, internal layers 1..N), so prorating by ID-span
-            # under-counts severely. Most vias are through-vias anyway;
-            # for blind/buried vias the absolute error is small (~1 mm).
+
+            # Use only the layer span ACTUALLY TRAVERSED by routed tracks
+            # connected to this via. For through-vias whose stub extends
+            # beyond the signal's entry/exit layers, this excludes the
+            # unused stub portion. The barrel weight equals the depth
+            # difference between the highest and lowest layers carrying
+            # connected tracks.
+            if _layer_depths:
+                used_layers = set()
+                try:
+                    for nb in connectivity.GetConnectedTracks(item):
+                        try:
+                            ncls = nb.GetClass()
+                        except Exception:
+                            continue
+                        if ncls in ("PCB_TRACK", "PCB_ARC"):
+                            try:
+                                used_layers.add(nb.GetLayer())
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                if len(used_layers) >= 2:
+                    used_depths = [_layer_depths[L] for L in used_layers
+                                   if L in _layer_depths]
+                    if len(used_depths) >= 2:
+                        return max(used_depths) - min(used_depths)
+
+                # Single layer used (or no connected tracks): no traversal,
+                # via contributes 0 length to this signal.
+                if len(used_layers) == 1:
+                    return 0
+
+                # No track connectivity info — fall back to physical span.
+                try:
+                    top = item.TopLayer()
+                    bot = item.BottomLayer()
+                    if top in _layer_depths and bot in _layer_depths:
+                        return abs(_layer_depths[bot] - _layer_depths[top])
+                except Exception:
+                    pass
+
+            # Last-resort fallback: full board thickness.
             return _board_thickness
         return 0
 
@@ -900,7 +1110,7 @@ class LengthMonitorDialog(wx.Frame):
     def __init__(self, board):
         super(LengthMonitorDialog, self).__init__(
             None,
-            title="Length & Skew Constraint Monitor (v2.9 - via thickness)",
+            title="Length & Skew Constraint Monitor (v3.3 - stackup uniform)",
             size=(980, 520),
             style=wx.DEFAULT_FRAME_STYLE | wx.STAY_ON_TOP
         )

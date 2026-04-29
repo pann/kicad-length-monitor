@@ -142,6 +142,42 @@ will see this as "plugin > KiCad" by exactly the stub length(s).
 
 ---
 
+## 5. Via barrel length: precise stackup-aware computation
+
+**Symptom**: Plugin reports per-via length using a uniform-thickness model
+(`board_thickness / (copper_layer_count − 1)` per layer step). For
+typical 6-layer 1.544 mm boards this gives 0.309 mm per dielectric gap.
+KiCad's net inspector / length tuner uses the real stackup descriptor
+which has variable thicknesses (prepreg vs core, outer vs inner). Result:
+plugin's per-net length comes in 1–2 mm under KiCad's value — about
+1.5 % off, within typical length-match tolerances but not exact.
+
+**What we tried (v3.2 stackup probe)**: `BOARD::GetDesignSettings()
+.GetStackupDescriptor()` returns an opaque SwigPyObject. Probing
+`dir(stackup)` shows only SWIG metadata methods (`acquire, append, disown,
+next, own`) — none of `GetList / GetItems / GetCount` are exposed.
+Cannot enumerate the stackup items from Python.
+
+**Why it doesn't matter much**: relative skew between nets is correct
+(every net uses the same uniform model), and the absolute error is
+small relative to typical length-match constraints (10–15 mm). The
+worst-offender ranking is unaffected.
+
+**Likely fixes to try**:
+- Parse the `.kicad_pcb` text file directly. The `(stackup ...)` block
+  in BOARD's own `(setup ...)` section contains explicit dielectric
+  thicknesses with copper layer associations. Reading the raw file
+  bypasses the SWIG opacity entirely.
+- Wait for upstream KiCad to expose the stackup walker via SWIG.
+- Use `IPC2581` export + parse — same data, different format.
+
+**Current state (v3.3)**: uniform-thickness fallback. Per-via barrel uses
+`max(used_layer_depth) − min(used_layer_depth)` over layers actually
+traversed by connected tracks (so through-via stubs are correctly
+excluded from the signal length).
+
+---
+
 ## Other ideas (lower priority)
 
 - Group Mean column alongside Group Skew (max-min already there).
