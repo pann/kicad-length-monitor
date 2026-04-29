@@ -1,0 +1,13 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor swap files
+*.swp
+*~
+.#*
+
+# Diagnostic log written by the plugin (in /tmp by default, but in case
+# someone redirects LENGTH_LOG into the plugin dir)
+length_monitor.log

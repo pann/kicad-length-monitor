@@ -1,0 +1,26 @@
+{
+    "identifier": "com.github.user.length_monitor",
+    "type": "plugin",
+    "author": {
+        "name": "KiCad Length Monitor"
+    },
+    "maintainer": {
+        "name": "KiCad Length Monitor"
+    },
+    "name": "Length Constraint Monitor",
+    "description": "Shows nets with length constraints, routed lengths and pass/fail status. Click nets/classes to select them on the board. Auto-updates as you route.",
+    "resources": {
+        "homepage": ""
+    },
+    "versions": [
+        {
+            "version": "1.0.0",
+            "status": "stable",
+            "kicad_version": "7.0",
+            "download_sha256": "",
+            "download_url": "",
+            "download_size": 0,
+            "install_size": 0
+        }
+    ]
+}
