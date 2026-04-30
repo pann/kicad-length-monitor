@@ -7,14 +7,35 @@ Supports sortable columns, clickable nets/classes/groups, and auto-update.
 import pcbnew
 import wx
 import wx.dataview as dv
+import os
 import re
 import heapq
+import time
+import concurrent.futures as cf
 from collections import defaultdict
 
 # Diagnostic log for the length-calculation. Tail with:
 #   tail -F /tmp/length_monitor.log
 # Set LENGTH_LOG = None to disable.
 LENGTH_LOG = "/tmp/length_monitor.log"
+
+# Performance knobs for build_rows() — flip these to A/B test responsiveness.
+#   LENGTH_USE_THREADS:    parallelise per-net length compute via ThreadPool.
+#                          Note: pcbnew's SWIG bindings probably don't release
+#                          the GIL, so threads may serialise anyway. Logged
+#                          timing per refresh shows whether it actually helps.
+#   LENGTH_THREAD_WORKERS: pool size when threading is enabled.
+LENGTH_USE_THREADS    = False
+LENGTH_THREAD_WORKERS = 4
+
+# Cross-poll caches. Keyed by board file path so opening a different
+# .kicad_pcb gets a clean slate.
+#   _DRU_CACHE      — {board_path: ((mtime_ns, size), length_rules, skew_rules)}
+#   _NETCLASS_CACHE — {board_path: (net_names_tuple, net_to_class_dict)}
+# build_rows() consults these on every poll; cache miss → re-parse / rebuild.
+# The Refresh button passes force=True to bypass and rebuild from scratch.
+_DRU_CACHE      = {}
+_NETCLASS_CACHE = {}
 
 def _llog(msg):
     if not LENGTH_LOG:
@@ -78,6 +99,26 @@ def _pad_copper_layers(pad):
         except Exception:
             return []
 
+def build_tracks_by_netcode(board):
+    """One-pass index of {net_code: [track, ...]} for the whole board.
+    Lets per-net length compute skip the inner full-track filter that
+    otherwise runs once per net."""
+    by_code = defaultdict(list)
+    for t in board.GetTracks():
+        by_code[t.GetNetCode()].append(t)
+    return by_code
+
+
+def build_pads_by_netcode(board):
+    """One-pass index of {net_code: [pad, ...]}. Same motivation as
+    build_tracks_by_netcode."""
+    by_code = defaultdict(list)
+    for fp in board.GetFootprints():
+        for pad in fp.Pads():
+            by_code[pad.GetNetCode()].append(pad)
+    return by_code
+
+
 def _bbox_contains(bbox, x, y):
     """BOX2I contains point (x, y) — handles both VECTOR2I and rect API."""
     if bbox is None:
@@ -131,11 +172,18 @@ def _net_name_for_code(board, net_code):
     return "?"
 
 
-def get_routed_length_mm(board, net_code):
+def get_routed_length_mm(board, net_code,
+                         tracks_for_net=None, pads_for_net=None):
     """Length of the longest pad-to-pad electrical path on the given net.
     Tries KiCad's CONNECTIVITY_DATA API first (which already knows what
     is connected to what — no geometric matching needed); if that's not
-    accessible falls back to total length of all primitives."""
+    accessible falls back to total length of all primitives.
+
+    tracks_for_net / pads_for_net (optional): pre-filtered lists of items
+    on this net only. When provided, skips the full-board scan that
+    otherwise runs once per net (turning O(N_nets · M_items) into O(M)).
+    build_rows() builds these indexes once per refresh.
+    """
     if net_code <= 0:
         return 0.0
 
@@ -143,12 +191,14 @@ def get_routed_length_mm(board, net_code):
 
     # First pass: collect items + total, also probe what the connectivity
     # API supports so we can pick the right code path.
+    if tracks_for_net is None:
+        tracks_for_net = [t for t in board.GetTracks()
+                          if t.GetNetCode() == net_code]
+
     total_iu = 0
     n_tracks = n_arcs = n_vias = 0
     items_on_net = []  # all primitives on the net (tracks/arcs/vias)
-    for t in board.GetTracks():
-        if t.GetNetCode() != net_code:
-            continue
+    for t in tracks_for_net:
         cls = t.GetClass()
         length = t.GetLength()
         total_iu += length
@@ -161,11 +211,14 @@ def get_routed_length_mm(board, net_code):
             n_vias += 1
 
     # Find all pads on the net.
-    pads = []
-    for fp in board.GetFootprints():
-        for pad in fp.Pads():
-            if pad.GetNetCode() == net_code:
-                pads.append(pad)
+    if pads_for_net is None:
+        pads = []
+        for fp in board.GetFootprints():
+            for pad in fp.Pads():
+                if pad.GetNetCode() == net_code:
+                    pads.append(pad)
+    else:
+        pads = list(pads_for_net)
 
     if len(pads) < 2:
         # Nothing to path-find between. For unrouted internal nets KiCad
@@ -747,6 +800,46 @@ def read_dru_text(board):
         return ""
 
 
+def parse_dru_rules_cached(board, force=False):
+    """mtime-cached wrapper around read_dru_text + parse_dru_rules.
+    Returns (length_rules, skew_rules). On cache hit (rules file's
+    mtime+size match the cached values) skips file IO and the regex
+    pass entirely — those used to run every poll.
+
+    force=True always re-parses (used by the manual Refresh button).
+    """
+    board_path = ""
+    try:
+        board_path = board.GetFileName() or ""
+    except Exception:
+        pass
+    if not board_path:
+        return [], []
+
+    dru_path = board_path.replace('.kicad_pcb', '.kicad_dru')
+    try:
+        st = os.stat(dru_path)
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        # No DRU file → drop any stale cache, return empty.
+        _DRU_CACHE.pop(board_path, None)
+        return [], []
+
+    if not force:
+        cached = _DRU_CACHE.get(board_path)
+        if cached is not None and cached[0] == sig:
+            return cached[1], cached[2]
+
+    try:
+        with open(dru_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+    except Exception:
+        return [], []
+    length_rules, skew_rules = parse_dru_rules(text)
+    _DRU_CACHE[board_path] = (sig, length_rules, skew_rules)
+    return length_rules, skew_rules
+
+
 # ------------------------------------------------------------------------------
 #  Net -> class mapping  (KiCad 9 compatible)
 # ------------------------------------------------------------------------------
@@ -800,6 +893,41 @@ def build_net_to_class(board):
     return net_to_class
 
 
+def build_net_to_class_cached(board, force=False):
+    """Cached wrapper around build_net_to_class. Cache key is the set of
+    net names — when nets are added/removed the mapping is rebuilt.
+
+    Caveat: if the user changes net-class ASSIGNMENT without adding /
+    removing nets (e.g. flips a net's class in Board Setup), the name set
+    is unchanged and the stale cached mapping would be returned. The
+    Refresh button passes force=True to bypass that case; auto-poll
+    refreshes don't, since they're driven by track edits where this
+    can't happen.
+    """
+    board_path = ""
+    try:
+        board_path = board.GetFileName() or ""
+    except Exception:
+        pass
+
+    try:
+        net_info = board.GetNetInfo()
+        names = net_info.NetsByName()
+        names_key = tuple(sorted(str(n) for n in names.keys()))
+    except Exception:
+        # Can't fingerprint — fall back to uncached build.
+        return build_net_to_class(board)
+
+    if not force:
+        cached = _NETCLASS_CACHE.get(board_path)
+        if cached is not None and cached[0] == names_key:
+            return cached[1]
+
+    n2c = build_net_to_class(board)
+    _NETCLASS_CACHE[board_path] = (names_key, n2c)
+    return n2c
+
+
 # ------------------------------------------------------------------------------
 #  Table columns
 # ------------------------------------------------------------------------------
@@ -828,7 +956,8 @@ NUMERIC_COLS = {COL_LEN, COL_MIN, COL_MAX, COL_MAX_SKEW, COL_ACT_SKEW}
 class NetRow(object):
     def __init__(self, net_name, class_name, length_mm,
                  min_mm, max_mm, skew_group, max_skew_mm,
-                 group_min_mm, group_max_mm):
+                 group_min_mm, group_max_mm,
+                 skew_violations=None):
         self.net_name      = net_name
         self.class_name    = class_name
         self.length_mm     = length_mm
@@ -837,12 +966,15 @@ class NetRow(object):
         self.skew_group    = skew_group
         self.max_skew_mm   = max_skew_mm
         # group_min_mm / group_max_mm = shortest / longest length across all
-        # nets in the same skew group. Stored on each row so per-row sort
-        # and per-row skew display stay row-local. Pass/fail still uses the
-        # group's spread (max - min) — that's a single value across the
-        # group, not per net.
+        # nets in the PRIMARY (tightest) skew group. Stored on each row so
+        # per-row sort and per-row skew display stay row-local.
         self.group_min_mm  = group_min_mm
         self.group_max_mm  = group_max_mm
+        # List of skew-rule names this net VIOLATES (any rule the net
+        # qualifies for whose group spread exceeds the rule's max_skew).
+        # A net passes only if this list is empty. Captures inter-group
+        # rules that aren't visible in the displayed skew_group column.
+        self.skew_violations = list(skew_violations) if skew_violations else []
 
     @property
     def actual_skew_mm(self):
@@ -877,15 +1009,23 @@ class NetRow(object):
 
     @property
     def skew_ok(self):
-        if self.max_skew_mm is None or self.group_skew_mm is None:
-            return True
-        # Group spread (max - min) must satisfy the constraint. If the
-        # group fails, every net in the group is flagged FAIL.
-        return self.group_skew_mm <= self.max_skew_mm
+        # A net passes ONLY if every applicable skew rule passes —
+        # including inter-group / multi-class rules that aren't surfaced
+        # in the primary skew_group column.
+        return len(self.skew_violations) == 0
 
     @property
     def is_ok(self):
         return self.length_ok and self.skew_ok
+
+    @property
+    def has_constraints(self):
+        """True if this net has any length / skew constraint to evaluate.
+        Used to decide whether to render a row as 'passing' (green) or
+        as unconstrained (default colour)."""
+        return (self.min_mm      is not None
+            or  self.max_mm      is not None
+            or  self.max_skew_mm is not None)
 
     @property
     def status(self):
@@ -894,8 +1034,11 @@ class NetRow(object):
         parts = []
         if not self.length_ok:
             parts.append("LEN")
-        if not self.skew_ok:
-            parts.append("SKEW")
+        if self.skew_violations:
+            # Show rule names so multi-rule failures are visible. If a
+            # net violates only its primary rule the message is short;
+            # if it violates an inter-group rule too, both show up here.
+            parts.append("SKEW(" + ",".join(self.skew_violations) + ")")
         return "FAIL: " + "+".join(parts)
 
     def get_col(self, col):
@@ -915,23 +1058,32 @@ class NetRow(object):
 #  Main data builder
 # ------------------------------------------------------------------------------
 
-def build_rows(board):
-    rules_text = read_dru_text(board)
-    if not rules_text:
+def build_rows(board, force=False):
+    """Build the list of NetRow objects shown in the table.
+
+    force=True bypasses the DRU-parse and net-to-class caches — used by
+    the manual Refresh button so the user has a way to recover from
+    edge cases (e.g. class reassignment without a net membership
+    change) that the cache invalidation can't detect on its own.
+    """
+    t_dru0 = time.perf_counter()
+    length_rules, skew_rules = parse_dru_rules_cached(board, force=force)
+    t_dru1 = time.perf_counter()
+    if not length_rules and not skew_rules:
         return []
 
-    length_rules, skew_rules = parse_dru_rules(rules_text)
-    net_to_class = build_net_to_class(board)
+    t_n2c0 = time.perf_counter()
+    net_to_class = build_net_to_class_cached(board, force=force)
+    t_n2c1 = time.perf_counter()
     net_info = board.GetNetInfo()
+    _llog("BUILD PERF: dru={:.4f}s  net_to_class={:.4f}s  force={}".format(
+        t_dru1 - t_dru0, t_n2c1 - t_n2c0, force))
 
-    # Pre-compute routed lengths
-    net_lengths = {}
-    for net_name, ni in net_info.NetsByName().items():
-        net_name = str(net_name)
-        if net_name:
-            net_lengths[net_name] = get_routed_length_mm(board, ni.GetNetCode())
-
-    # Accumulate constraints per net
+    # Accumulate constraints per net. net_data is built BEFORE we touch
+    # any track geometry — its keyset is the "interesting nets" set, i.e.
+    # nets that any length or skew rule applies to. Length compute then
+    # runs only on this subset (used to be done for every net on the
+    # board).
     net_data = {}
 
     def ensure(net_name):
@@ -957,51 +1109,167 @@ def build_rows(board):
                         d['max_mm'] = min(d['max_mm'], rule['max_mm']) \
                             if d['max_mm'] is not None else rule['max_mm']
 
+    # ── Inter-group + internal-group skew handling ────────────────────
+    #
+    # Each net may belong to MULTIPLE skew rules at once (e.g. its own
+    # internal-class rule AND a multi-class group rule). We track all
+    # applicable rules per net, compute each rule's group spread from
+    # its full member set, and surface violations from ANY rule.
+    #
+    # The "primary" rule (shown in the Skew Group / Max Skew / Act. Skew
+    # columns) is the tightest one; in the rare tie, we pick the one
+    # with the largest current spread so the more-actionable info shows.
+
+    # Step 1: for each rule, the set of member nets (the group of nets
+    # whose lengths form the spread evaluated by this rule).
+    rule_members = defaultdict(set)
     for rule in skew_rules:
         for cls in rule['classes']:
             for net_name, nc in net_to_class.items():
                 if nc == cls:
                     ensure(str(net_name))
-                    d = net_data[net_name]
-                    if d['max_skew_mm'] is None or \
-                       rule['max_skew_mm'] < d['max_skew_mm']:
-                        d['max_skew_mm'] = rule['max_skew_mm']
-                        d['skew_group']  = rule['rule_name']
+                    rule_members[rule['rule_name']].add(net_name)
+
+    # ── Length compute, restricted to interesting nets ───────────────
+    # Walk the board ONCE to index tracks and pads by net code, then
+    # call get_routed_length_mm only for nets in net_data. Optionally
+    # parallelise across LENGTH_THREAD_WORKERS threads — note that
+    # pcbnew's SWIG bindings probably don't release the GIL, so the
+    # benefit is build-dependent. The timing log below tells the truth.
+    net_lengths = {}
+    if net_data:
+        t_idx0 = time.perf_counter()
+        tracks_by_code = build_tracks_by_netcode(board)
+        pads_by_code   = build_pads_by_netcode(board)
+        t_idx1 = time.perf_counter()
+
+        # Resolve net code per name once.
+        work = []  # [(net_name, net_code), ...]
+        for net_name in net_data:
+            try:
+                ni = net_info.GetNetItem(net_name)
+            except Exception:
+                ni = None
+            if ni is None:
+                continue
+            try:
+                code = ni.GetNetCode()
+            except Exception:
+                continue
+            work.append((net_name, code))
+
+        def _calc_one(item):
+            name, code = item
+            try:
+                length = get_routed_length_mm(
+                    board, code,
+                    tracks_for_net=tracks_by_code.get(code, []),
+                    pads_for_net=pads_by_code.get(code, []),
+                )
+            except Exception as ex:
+                _llog("LENGTH CALC EXC net={!r} code={}: {}".format(
+                    name, code, ex))
+                length = 0.0
+            return name, length
+
+        threaded = LENGTH_USE_THREADS and len(work) > 1
+        t_calc0 = time.perf_counter()
+        if threaded:
+            try:
+                with cf.ThreadPoolExecutor(
+                        max_workers=LENGTH_THREAD_WORKERS) as ex:
+                    for name, length in ex.map(_calc_one, work):
+                        net_lengths[name] = length
+            except Exception as ex:
+                # Threading failed unexpectedly — fall back to sequential
+                # so the table still refreshes.
+                _llog("LENGTH CALC THREAD-POOL EXC: {} -- falling back".format(ex))
+                threaded = False
+                net_lengths.clear()
+                for it in work:
+                    name, length = _calc_one(it)
+                    net_lengths[name] = length
+        else:
+            for it in work:
+                name, length = _calc_one(it)
+                net_lengths[name] = length
+        t_calc1 = time.perf_counter()
+
+        _llog("LENGTH PERF: {} interesting nets ({} threads={})  "
+              "index={:.3f}s  compute={:.3f}s"
+              .format(len(work),
+                      LENGTH_THREAD_WORKERS if threaded else 1,
+                      threaded,
+                      t_idx1 - t_idx0,
+                      t_calc1 - t_calc0))
+
+    # Step 2: per-rule group spread (max - min over member lengths).
+    rule_spread = {}  # rule_name -> {min, max, spread, max_skew}
+    rule_by_name = {r['rule_name']: r for r in skew_rules}
+    for rname, members in rule_members.items():
+        if not members:
+            continue
+        lens = [net_lengths.get(m, 0.0) for m in members]
+        gmin = min(lens)
+        gmax = max(lens)
+        rule_spread[rname] = {
+            'min':      gmin,
+            'max':      gmax,
+            'spread':   gmax - gmin,
+            'max_skew': rule_by_name[rname]['max_skew_mm'],
+        }
+
+    # Step 3: per-net rule list and violation list.
+    for net_name in list(net_data.keys()):
+        d = net_data[net_name]
+        applicable = []  # list of dicts with rule + spread info
+        for rname, rs in rule_spread.items():
+            if net_name in rule_members[rname]:
+                applicable.append({
+                    'name':     rname,
+                    'max_skew': rs['max_skew'],
+                    'min':      rs['min'],
+                    'max':      rs['max'],
+                    'spread':   rs['spread'],
+                })
+
+        if not applicable:
+            d['skew_group']      = ""
+            d['max_skew_mm']     = None
+            d['group_min_mm']    = None
+            d['group_max_mm']    = None
+            d['skew_violations'] = []
+            continue
+
+        # Tightest constraint wins for the displayed columns; tie-break
+        # by largest spread (so the more actionable group is surfaced).
+        primary = min(applicable, key=lambda r: (r['max_skew'], -r['spread']))
+        d['skew_group']    = primary['name']
+        d['max_skew_mm']   = primary['max_skew']
+        d['group_min_mm']  = primary['min']
+        d['group_max_mm']  = primary['max']
+
+        # Violations across ALL applicable rules — pass = no violations.
+        d['skew_violations'] = [r['name'] for r in applicable
+                                if r['spread'] > r['max_skew']]
 
     if not net_data:
         return []
 
-    # Compute group min and max so each NetRow can carry a per-net actual
-    # skew (length - group_min) AND we can still compute group spread
-    # (group_max - group_min) for pass/fail.
-    group_lengths = defaultdict(list)
-    for net_name, d in net_data.items():
-        if d['skew_group']:
-            group_lengths[d['skew_group']].append(net_lengths.get(net_name, 0.0))
-
-    group_min = {}
-    group_max = {}
-    for g, lens in group_lengths.items():
-        if lens:
-            group_min[g] = min(lens)
-            group_max[g] = max(lens)
-
     # Build rows
     rows = []
     for net_name, d in sorted(net_data.items()):
-        grp = d['skew_group']
-        gmin = group_min.get(grp) if grp else None
-        gmax = group_max.get(grp) if grp else None
         rows.append(NetRow(
-            net_name     = net_name,
-            class_name   = net_to_class.get(net_name, "Default"),
-            length_mm    = net_lengths.get(net_name, 0.0),
-            min_mm       = d['min_mm'],
-            max_mm       = d['max_mm'],
-            skew_group   = grp,
-            max_skew_mm  = d['max_skew_mm'],
-            group_min_mm = gmin,
-            group_max_mm = gmax,
+            net_name        = net_name,
+            class_name      = net_to_class.get(net_name, "Default"),
+            length_mm       = net_lengths.get(net_name, 0.0),
+            min_mm          = d['min_mm'],
+            max_mm          = d['max_mm'],
+            skew_group      = d.get('skew_group', ""),
+            max_skew_mm     = d.get('max_skew_mm'),
+            group_min_mm    = d.get('group_min_mm'),
+            group_max_mm    = d.get('group_max_mm'),
+            skew_violations = d.get('skew_violations', []),
         ))
 
     return rows
@@ -1030,11 +1298,15 @@ class NetTableModel(dv.DataViewIndexListModel):
     def GetAttrByRow(self, row, col, attr):
         if row >= len(self.rows):
             return False
-        if not self.rows[row].is_ok:
-            attr.SetColour(wx.Colour(200, 50, 50))
+        r = self.rows[row]
+        if not r.is_ok:
+            attr.SetColour(wx.Colour(200, 50, 50))   # red — failing
             attr.SetBold(True)
             return True
-        return False
+        if r.has_constraints:
+            attr.SetColour(wx.Colour(0, 130, 0))     # green — passing
+            return True
+        return False  # unconstrained — default colour
 
     def SetValueByRow(self, value, row, col):
         return False
@@ -1088,15 +1360,16 @@ class NetTableModel(dv.DataViewIndexListModel):
         """True if two NetRow objects look identical to the user (same
         values in every visible column). Used to skip unnecessary
         RowChanged notifications."""
-        return (a.net_name     == b.net_name
-            and a.class_name    == b.class_name
-            and a.length_mm     == b.length_mm
-            and a.min_mm        == b.min_mm
-            and a.max_mm        == b.max_mm
-            and a.skew_group    == b.skew_group
-            and a.max_skew_mm   == b.max_skew_mm
-            and a.group_min_mm  == b.group_min_mm
-            and a.group_max_mm  == b.group_max_mm)
+        return (a.net_name        == b.net_name
+            and a.class_name       == b.class_name
+            and a.length_mm        == b.length_mm
+            and a.min_mm           == b.min_mm
+            and a.max_mm           == b.max_mm
+            and a.skew_group       == b.skew_group
+            and a.max_skew_mm      == b.max_skew_mm
+            and a.group_min_mm     == b.group_min_mm
+            and a.group_max_mm     == b.group_max_mm
+            and a.skew_violations  == b.skew_violations)
 
 
 # ------------------------------------------------------------------------------
@@ -1110,7 +1383,7 @@ class LengthMonitorDialog(wx.Frame):
     def __init__(self, board):
         super(LengthMonitorDialog, self).__init__(
             None,
-            title="Length & Skew Constraint Monitor (v3.3 - stackup uniform)",
+            title="Length & Skew Constraint Monitor (v3.7 - cached DRU + net-to-class)",
             size=(980, 520),
             style=wx.DEFAULT_FRAME_STYLE | wx.STAY_ON_TOP
         )
@@ -1136,7 +1409,7 @@ class LengthMonitorDialog(wx.Frame):
         tb = wx.BoxSizer(wx.HORIZONTAL)
         self.lbl_status = wx.StaticText(panel, label="")
         btn_refresh = wx.Button(panel, label="Refresh", size=(80, -1))
-        btn_refresh.Bind(wx.EVT_BUTTON, lambda e: self._refresh())
+        btn_refresh.Bind(wx.EVT_BUTTON, lambda e: self._refresh(force=True))
         self.chk_auto = wx.CheckBox(panel, label="Auto-update")
         self.chk_auto.SetValue(True)
         self.chk_auto.Bind(wx.EVT_CHECKBOX, self._on_auto_toggle)
@@ -1208,7 +1481,11 @@ class LengthMonitorDialog(wx.Frame):
         except Exception:
             return None
 
-    def _refresh(self):
+    def _refresh(self, force=False):
+        """force=True bypasses the DRU-parse + net-to-class caches.
+        Wired to the Refresh button so the user has a recovery path
+        when class assignments change without a net add/remove (which
+        the cache fingerprint can't detect)."""
         try:
             # Capture current dvc selection by NET NAME so it can be
             # restored after refresh even if the row count or order changes.
@@ -1222,7 +1499,7 @@ class LengthMonitorDialog(wx.Frame):
             except Exception:
                 pass
 
-            self._all_rows = build_rows(self.board)
+            self._all_rows = build_rows(self.board, force=force)
             filtered = self._apply_filter(self._all_rows)
             self.model.refresh(filtered)
             fails = sum(1 for r in filtered if not r.is_ok)
