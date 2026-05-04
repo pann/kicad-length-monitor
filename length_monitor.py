@@ -99,6 +99,99 @@ def _pad_copper_layers(pad):
         except Exception:
             return []
 
+
+def _pad_identity(pad):
+    """Identity tuple used to recognise 'identical loads' on a net.
+    Two pads with the same (FPID, pin_number) are presumed to be the
+    same physical pin on two instances of the same component — e.g.
+    pin BX25 on two identical DDR memory packages.
+
+    Returns ("", "") if neither field can be read; the caller treats
+    that as 'cannot identify' and bails out of the source heuristic.
+    """
+    fp = None
+    for attr in ("GetParentFootprint", "GetParent"):
+        fn = getattr(pad, attr, None)
+        if fn is None:
+            continue
+        try:
+            cand = fn()
+        except Exception:
+            cand = None
+        if cand is not None:
+            fp = cand
+            break
+
+    fpid_str = ""
+    if fp is not None:
+        try:
+            fpid = fp.GetFPID()
+        except Exception:
+            fpid = None
+        if fpid is not None:
+            for method in ("GetUniStringLibId", "Format", "AsString"):
+                fn = getattr(fpid, method, None)
+                if fn is None:
+                    continue
+                try:
+                    s = str(fn())
+                    if s:
+                        fpid_str = s
+                        break
+                except Exception:
+                    continue
+            if not fpid_str:
+                try:
+                    fpid_str = str(fpid)
+                except Exception:
+                    pass
+
+    try:
+        pin = str(pad.GetNumber())
+    except Exception:
+        pin = ""
+
+    return (fpid_str, pin)
+
+
+def _identify_source_pad(pads):
+    """Find the SOURCE pad on a net assuming the others are identical
+    loads. Heuristic: group pads by (FPID, pin number); the largest
+    group of size >= 2 are the loads; if exactly one pad remains, that's
+    the source. Returns the source pad object, or None if the topology
+    is ambiguous (point-to-point, no matching loads, multiple
+    non-matching pads, etc.).
+
+    Designed for the typical fly-by / T-junction case: one driver feeds
+    N identical chips on the same physical pin (memories, transceivers,
+    LEDs in a chain). For those, BGA cell numbers / QFN pin numbers
+    coincide between identical packages, so the loads share identity.
+    """
+    if len(pads) < 3:
+        # Point-to-point — long arm == short arm by definition; no need
+        # to identify a source.
+        return None
+
+    groups = defaultdict(list)
+    for i, pad in enumerate(pads):
+        ident = _pad_identity(pad)
+        if ident == ("", ""):
+            return None  # Couldn't fingerprint a pad — bail conservatively.
+        groups[ident].append(i)
+
+    # Largest group with at least 2 members are the loads.
+    biggest = max(groups.values(), key=len, default=[])
+    if len(biggest) < 2:
+        return None
+
+    others = [pads[i] for i in range(len(pads)) if i not in biggest]
+    if len(others) == 1:
+        return others[0]
+    # 0 source candidates (every pad matches the load identity), or
+    # 2+ source candidates (more than one unique pad) → ambiguous.
+    return None
+
+
 def build_tracks_by_netcode(board):
     """One-pass index of {net_code: [track, ...]} for the whole board.
     Lets per-net length compute skip the inner full-track filter that
@@ -172,20 +265,26 @@ def _net_name_for_code(board, net_code):
     return "?"
 
 
-def get_routed_length_mm(board, net_code,
-                         tracks_for_net=None, pads_for_net=None):
-    """Length of the longest pad-to-pad electrical path on the given net.
-    Tries KiCad's CONNECTIVITY_DATA API first (which already knows what
-    is connected to what — no geometric matching needed); if that's not
-    accessible falls back to total length of all primitives.
+def get_routed_lengths_mm(board, net_code,
+                          tracks_for_net=None, pads_for_net=None):
+    """Returns (long_mm, short_mm) for the given net:
+        long_mm  — longest pad-to-pad electrical path  (the canonical
+                   "routed length", matches KiCad's net inspector)
+        short_mm — SHORTEST pad-to-pad path on the net. On a 2-pad net
+                   this equals long_mm. On a T-junction / star, it's the
+                   load-to-load distance — useful for catching stub
+                   mismatch in a branched route.
+
+    Tries KiCad's CONNECTIVITY_DATA API first; falls back to total length
+    of all primitives on the net (in which case long_mm == short_mm
+    since there's no topology to differentiate).
 
     tracks_for_net / pads_for_net (optional): pre-filtered lists of items
     on this net only. When provided, skips the full-board scan that
-    otherwise runs once per net (turning O(N_nets · M_items) into O(M)).
-    build_rows() builds these indexes once per refresh.
+    otherwise runs once per net.
     """
     if net_code <= 0:
-        return 0.0
+        return 0.0, 0.0
 
     net_name = _net_name_for_code(board, net_code)
 
@@ -221,29 +320,31 @@ def get_routed_length_mm(board, net_code,
         pads = list(pads_for_net)
 
     if len(pads) < 2:
-        # Nothing to path-find between. For unrouted internal nets KiCad
-        # returns 0, so we do too — total can be 0 anyway.
+        # Nothing to path-find between. long == short by definition.
         result = iu_to_mm(total_iu)
         _llog("net={:4d} {!r:<32} <2pads tr={} arc={} via={} total={:.3f} -> fallback {:.3f}"
               .format(net_code, net_name, n_tracks, n_arcs, n_vias,
                       iu_to_mm(total_iu), result))
-        return result
+        return result, result
 
     # Try the CONNECTIVITY_DATA-based path first.
-    cd_result, n_edges = _length_via_connectivity(
+    long_mm, short_mm, n_edges, method = _length_via_connectivity(
         board, net_code, pads, items_on_net)
-    if cd_result is not None:
-        _llog("net={:4d} {!r:<32} tr={} arc={} via={} pads={} edges={} total={:.3f} -> CONN {:.3f}"
+    if long_mm is not None:
+        _llog("net={:4d} {!r:<32} tr={} arc={} via={} pads={} edges={} total={:.3f} -> CONN[{}] long={:.3f} short={:.3f}"
               .format(net_code, net_name, n_tracks, n_arcs, n_vias, len(pads),
-                      n_edges, iu_to_mm(total_iu), cd_result))
-        return cd_result
+                      n_edges, iu_to_mm(total_iu), method, long_mm,
+                      short_mm if short_mm is not None else -1.0))
+        if short_mm is None:
+            short_mm = long_mm
+        return long_mm, short_mm
 
-    # Last-resort fallback.
+    # Last-resort fallback. No topology info — short collapses to long.
     result = iu_to_mm(total_iu)
-    _llog("net={:4d} {!r:<32} tr={} arc={} via={} pads={} edges={} total={:.3f} -> CONN-FAIL fallback {:.3f}"
+    _llog("net={:4d} {!r:<32} tr={} arc={} via={} pads={} edges={} total={:.3f} -> CONN-FAIL[{}] fallback {:.3f}"
           .format(net_code, net_name, n_tracks, n_arcs, n_vias, len(pads),
-                  n_edges, iu_to_mm(total_iu), result))
-    return result
+                  n_edges, iu_to_mm(total_iu), method, result))
+    return result, result
 
 
 # One-shot flag so we only log the API probe once per session.
@@ -682,7 +783,7 @@ def _length_via_connectivity(board, net_code, pads, items):
             add_edge(k, nb_k, edge_w)
 
     if len(pad_ids) < 2:
-        return None, len(edge_set)
+        return None, None, len(edge_set), "no-pads"
 
     def dijkstra(src):
         dist = {src: 0}
@@ -699,17 +800,62 @@ def _length_via_connectivity(board, net_code, pads, items):
         return dist
 
     pad_id_list = list(pad_ids)
+
+    # ── Preferred path: source-relative arm computation ──────────────
+    # If we can identify the source pad (the unique pad among ≥2
+    # identical loads), report long / short as max / min Dijkstra
+    # distances FROM the source to each load. This matches the user's
+    # mental model in DDR-style fly-by / T-junction routing: timing
+    # skew is determined by source→load arm differences, not by
+    # load↔load shortcuts through a branch point.
+    source_pad = _identify_source_pad(pads)
+    if source_pad is not None:
+        src_key = _key(source_pad)
+        if src_key in graph:
+            d = dijkstra(src_key)
+            load_dists = []
+            for k in pad_id_list:
+                if k == src_key:
+                    continue
+                if k in d:
+                    load_dists.append(d[k])
+            if load_dists:
+                max_iu = max(load_dists)
+                min_iu = min(load_dists)
+                src_ident = _pad_identity(source_pad)
+                method = "src={}/{}".format(src_ident[0].rsplit(":", 1)[-1]
+                                            or "?", src_ident[1] or "?")
+                return (iu_to_mm(max_iu), iu_to_mm(min_iu),
+                        len(edge_set), method)
+
+    # ── Fallback: all-pairs min/max ─────────────────────────────────
+    # Used when:
+    #   - net has only 2 pads (long == short trivially), or
+    #   - source pad couldn't be identified (mixed-vendor loads, no
+    #     identity match, ambiguous topology), or
+    #   - the identified source isn't reachable in the connectivity
+    #     graph (unrouted from that pad).
+    # On a T-junction with this fallback, min_iu is the load↔load
+    # shortcut, which still surfaces stub mismatch — just from a
+    # different angle than the source-relative view.
     max_iu = 0
+    min_iu = None
     for i, src in enumerate(pad_id_list):
         if src not in graph:
             continue
         d = dijkstra(src)
         for tgt in pad_id_list[i+1:]:
-            if tgt in d and d[tgt] > max_iu:
-                max_iu = d[tgt]
+            if tgt not in d:
+                continue
+            dist = d[tgt]
+            if dist > max_iu:
+                max_iu = dist
+            if min_iu is None or dist < min_iu:
+                min_iu = dist
     if max_iu == 0:
-        return None, len(edge_set)
-    return iu_to_mm(max_iu), len(edge_set)
+        return None, None, len(edge_set), "no-paths"
+    short_mm = iu_to_mm(min_iu) if min_iu is not None else None
+    return iu_to_mm(max_iu), short_mm, len(edge_set), "all-pairs"
 
 
 # ------------------------------------------------------------------------------
@@ -934,19 +1080,21 @@ def build_net_to_class_cached(board, force=False):
 
 COL_NET      = 0
 COL_CLASS    = 1
-COL_LEN      = 2
-COL_MIN      = 3
-COL_MAX      = 4
-COL_SKEW_GRP = 5
-COL_MAX_SKEW = 6
-COL_ACT_SKEW = 7
-COL_STATUS   = 8
+COL_LEN      = 2   # longest pad-to-pad
+COL_SHORT    = 3   # shortest pad-to-pad ("short arm" — catches T-junction stub mismatch)
+COL_MIN      = 4
+COL_MAX      = 5
+COL_SKEW_GRP = 6
+COL_MAX_SKEW = 7
+COL_ACT_SKEW = 8
+COL_STATUS   = 9
 
-COLUMNS    = ["Net Name",  "Net Class", "Routed (mm)", "Min (mm)", "Max (mm)",
-              "Skew Group", "Max Skew",  "Act. Skew",   "Status"]
-COL_WIDTHS = [200, 110, 100, 85, 85, 160, 80, 80, 80]
+COLUMNS    = ["Net Name",  "Net Class", "Routed (mm)", "Short Arm (mm)",
+              "Min (mm)",  "Max (mm)",  "Skew Group", "Max Skew",
+              "Act. Skew", "Status"]
+COL_WIDTHS = [200, 110, 100, 110, 85, 85, 160, 80, 80, 80]
 
-NUMERIC_COLS = {COL_LEN, COL_MIN, COL_MAX, COL_MAX_SKEW, COL_ACT_SKEW}
+NUMERIC_COLS = {COL_LEN, COL_SHORT, COL_MIN, COL_MAX, COL_MAX_SKEW, COL_ACT_SKEW}
 
 
 # ------------------------------------------------------------------------------
@@ -954,13 +1102,18 @@ NUMERIC_COLS = {COL_LEN, COL_MIN, COL_MAX, COL_MAX_SKEW, COL_ACT_SKEW}
 # ------------------------------------------------------------------------------
 
 class NetRow(object):
-    def __init__(self, net_name, class_name, length_mm,
+    def __init__(self, net_name, class_name, length_mm, short_mm,
                  min_mm, max_mm, skew_group, max_skew_mm,
                  group_min_mm, group_max_mm,
                  skew_violations=None):
         self.net_name      = net_name
         self.class_name    = class_name
+        # length_mm = longest pad-to-pad ("Routed"); short_mm = shortest
+        # pad-to-pad ("Short Arm"). On a 2-pad net they're equal. On a
+        # T-junction / star, short_mm is the load-to-load distance,
+        # which surfaces stub mismatch in the routing.
         self.length_mm     = length_mm
+        self.short_mm      = short_mm
         self.min_mm        = min_mm
         self.max_mm        = max_mm
         self.skew_group    = skew_group
@@ -1000,19 +1153,45 @@ class NetRow(object):
         return self.group_max_mm - self.group_min_mm
 
     @property
+    def intra_net_skew_mm(self):
+        """Long arm − short arm. On a T-junction this is the stub
+        mismatch (timing skew between the two destinations of a
+        branched route). 0 for 2-pad nets."""
+        if self.short_mm is None:
+            return None
+        return self.length_mm - self.short_mm
+
+    @property
+    def intra_net_skew_violation(self):
+        """True when (long − short) exceeds the net's max_skew rule.
+        Catches T-junction stub mismatch in branched routes."""
+        if self.max_skew_mm is None or self.short_mm is None:
+            return False
+        return (self.length_mm - self.short_mm) > self.max_skew_mm
+
+    @property
     def length_ok(self):
-        if self.min_mm is not None and self.length_mm < self.min_mm:
-            return False
-        if self.max_mm is not None and self.length_mm > self.max_mm:
-            return False
+        # Both arms (long AND short) must satisfy the length range.
+        # If only the long arm is checked, a T-junction with a far-too-
+        # short stub passes when min_mm is set but the stub is shorter
+        # than min — which is a real routing defect to flag.
+        for L in (self.length_mm, self.short_mm):
+            if L is None:
+                continue
+            if self.min_mm is not None and L < self.min_mm:
+                return False
+            if self.max_mm is not None and L > self.max_mm:
+                return False
         return True
 
     @property
     def skew_ok(self):
         # A net passes ONLY if every applicable skew rule passes —
         # including inter-group / multi-class rules that aren't surfaced
-        # in the primary skew_group column.
-        return len(self.skew_violations) == 0
+        # in the primary skew_group column — AND its intra-net stub
+        # mismatch is within the same skew budget.
+        return (len(self.skew_violations) == 0
+                and not self.intra_net_skew_violation)
 
     @property
     def is_ok(self):
@@ -1039,12 +1218,20 @@ class NetRow(object):
             # net violates only its primary rule the message is short;
             # if it violates an inter-group rule too, both show up here.
             parts.append("SKEW(" + ",".join(self.skew_violations) + ")")
+        if self.intra_net_skew_violation:
+            # The two arms of a branched (T-junction) route diverge by
+            # more than the skew budget allows. Distinct from group
+            # SKEW above so the user can tell whether the problem is
+            # this net's own stub mismatch or its mismatch with peers.
+            parts.append("INTRA-SKEW")
         return "FAIL: " + "+".join(parts)
 
     def get_col(self, col):
         if col == COL_NET:      return self.net_name
         if col == COL_CLASS:    return self.class_name
         if col == COL_LEN:      return "{:.3f}".format(self.length_mm)
+        if col == COL_SHORT:
+            return "{:.3f}".format(self.short_mm) if self.short_mm is not None else "-"
         if col == COL_MIN:      return mm_str(self.min_mm)
         if col == COL_MAX:      return mm_str(self.max_mm)
         if col == COL_SKEW_GRP: return self.skew_group
@@ -1132,11 +1319,13 @@ def build_rows(board, force=False):
 
     # ── Length compute, restricted to interesting nets ───────────────
     # Walk the board ONCE to index tracks and pads by net code, then
-    # call get_routed_length_mm only for nets in net_data. Optionally
-    # parallelise across LENGTH_THREAD_WORKERS threads — note that
+    # call get_routed_lengths_mm only for nets in net_data. Returns
+    # (long_mm, short_mm) per net so the Short Arm column has data.
+    # Optionally parallelise across LENGTH_THREAD_WORKERS threads —
     # pcbnew's SWIG bindings probably don't release the GIL, so the
     # benefit is build-dependent. The timing log below tells the truth.
-    net_lengths = {}
+    net_lengths = {}        # net_name -> long_mm  (longest pad-to-pad)
+    net_short_lengths = {}  # net_name -> short_mm (shortest pad-to-pad)
     if net_data:
         t_idx0 = time.perf_counter()
         tracks_by_code = build_tracks_by_netcode(board)
@@ -1161,7 +1350,7 @@ def build_rows(board, force=False):
         def _calc_one(item):
             name, code = item
             try:
-                length = get_routed_length_mm(
+                long_mm, short_mm = get_routed_lengths_mm(
                     board, code,
                     tracks_for_net=tracks_by_code.get(code, []),
                     pads_for_net=pads_by_code.get(code, []),
@@ -1169,8 +1358,8 @@ def build_rows(board, force=False):
             except Exception as ex:
                 _llog("LENGTH CALC EXC net={!r} code={}: {}".format(
                     name, code, ex))
-                length = 0.0
-            return name, length
+                long_mm, short_mm = 0.0, 0.0
+            return name, long_mm, short_mm
 
         threaded = LENGTH_USE_THREADS and len(work) > 1
         t_calc0 = time.perf_counter()
@@ -1178,21 +1367,25 @@ def build_rows(board, force=False):
             try:
                 with cf.ThreadPoolExecutor(
                         max_workers=LENGTH_THREAD_WORKERS) as ex:
-                    for name, length in ex.map(_calc_one, work):
-                        net_lengths[name] = length
+                    for name, long_mm, short_mm in ex.map(_calc_one, work):
+                        net_lengths[name]       = long_mm
+                        net_short_lengths[name] = short_mm
             except Exception as ex:
                 # Threading failed unexpectedly — fall back to sequential
                 # so the table still refreshes.
                 _llog("LENGTH CALC THREAD-POOL EXC: {} -- falling back".format(ex))
                 threaded = False
                 net_lengths.clear()
+                net_short_lengths.clear()
                 for it in work:
-                    name, length = _calc_one(it)
-                    net_lengths[name] = length
+                    name, long_mm, short_mm = _calc_one(it)
+                    net_lengths[name]       = long_mm
+                    net_short_lengths[name] = short_mm
         else:
             for it in work:
-                name, length = _calc_one(it)
-                net_lengths[name] = length
+                name, long_mm, short_mm = _calc_one(it)
+                net_lengths[name]       = long_mm
+                net_short_lengths[name] = short_mm
         t_calc1 = time.perf_counter()
 
         _llog("LENGTH PERF: {} interesting nets ({} threads={})  "
@@ -1259,10 +1452,12 @@ def build_rows(board, force=False):
     # Build rows
     rows = []
     for net_name, d in sorted(net_data.items()):
+        long_mm = net_lengths.get(net_name, 0.0)
         rows.append(NetRow(
             net_name        = net_name,
             class_name      = net_to_class.get(net_name, "Default"),
-            length_mm       = net_lengths.get(net_name, 0.0),
+            length_mm       = long_mm,
+            short_mm        = net_short_lengths.get(net_name, long_mm),
             min_mm          = d['min_mm'],
             max_mm          = d['max_mm'],
             skew_group      = d.get('skew_group', ""),
@@ -1363,6 +1558,7 @@ class NetTableModel(dv.DataViewIndexListModel):
         return (a.net_name        == b.net_name
             and a.class_name       == b.class_name
             and a.length_mm        == b.length_mm
+            and a.short_mm         == b.short_mm
             and a.min_mm           == b.min_mm
             and a.max_mm           == b.max_mm
             and a.skew_group       == b.skew_group
@@ -1383,7 +1579,7 @@ class LengthMonitorDialog(wx.Frame):
     def __init__(self, board):
         super(LengthMonitorDialog, self).__init__(
             None,
-            title="Length & Skew Constraint Monitor (v3.7 - cached DRU + net-to-class)",
+            title="Length & Skew Constraint Monitor (v3.8 - short arm = source-relative)",
             size=(980, 520),
             style=wx.DEFAULT_FRAME_STYLE | wx.STAY_ON_TOP
         )
