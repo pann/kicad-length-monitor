@@ -29,17 +29,15 @@ Copy the **`length_monitor`** folder to your KiCad scripting plugins directory:
 
 | OS | Path |
 |---|---|
-| Windows | `%APPDATA%\kicad\7.0\scripting\plugins\` |
-| Linux | `~/.local/share/kicad/7.0/scripting/plugins/` |
-| macOS | `~/Library/Preferences/kicad/7.0/scripting/plugins/` |
-
-Adjust `7.0` to match your KiCad version (e.g. `8.0`).
+| Windows | `%APPDATA%\kicad\9.0\scripting\plugins\` |
+| Linux | `~/.local/share/kicad/9.0/scripting/plugins/` |
+| macOS | `~/Library/Preferences/kicad/9.0/scripting/plugins/` |
 
 ### Method B — Symlink (developer mode)
 
 ```bash
 ln -s /path/to/length_monitor \
-  ~/.local/share/kicad/7.0/scripting/plugins/length_monitor
+  ~/.local/share/kicad/9.0/scripting/plugins/length_monitor
 ```
 
 ### Activate the plugin
@@ -117,5 +115,6 @@ The plugin reads any rule that contains a `length` constraint:
 
 ## Compatibility
 
-Tested on KiCad 7.x and 8.x. The `pcbnew` Python API is used directly;
-no third-party packages required.
+Developed and tested on KiCad 9. The `pcbnew` Python API is used directly;
+no third-party packages required. The plugin relies on KiCad 9's
+net-settings and connectivity APIs.
