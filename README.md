@@ -3,6 +3,8 @@
 A KiCad PCB Editor plugin that lists all nets with length constraints,
 shows routed lengths, and highlights pass/fail status in a live table.
 
+![Length & Skew Constraint Monitor — main window](docs/screenshot.png)
+
 ---
 
 ## Features
