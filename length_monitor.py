@@ -100,6 +100,66 @@ def _pad_copper_layers(pad):
             return []
 
 
+def _is_test_point_footprint(fp):
+    """True when the footprint is a probe/test point. Test points are
+    not signal endpoints — they're access points for a probe — so they
+    must be excluded from the pad list used for long/short arm
+    computation. Otherwise a test point dangling off the trace makes
+    the route look like a T-junction with a huge stub mismatch.
+
+    Heuristic: 'testpoint' (or 'test_point') appears, case-insensitive,
+    in either the FPID library name or the footprint name. Catches the
+    standard KiCad TestPoint:* library plus common custom-library
+    naming variants."""
+    if fp is None:
+        return False
+    try:
+        fpid = fp.GetFPID()
+    except Exception:
+        return False
+
+    lib_name = ""
+    for method in ("GetUniStringLibNickname", "GetLibNickname"):
+        fn = getattr(fpid, method, None)
+        if fn is None:
+            continue
+        try:
+            s = str(fn())
+            if s:
+                lib_name = s
+                break
+        except Exception:
+            continue
+
+    fp_name = ""
+    for method in ("GetUniStringLibItemName", "GetLibItemName"):
+        fn = getattr(fpid, method, None)
+        if fn is None:
+            continue
+        try:
+            s = str(fn())
+            if s:
+                fp_name = s
+                break
+        except Exception:
+            continue
+
+    blob = (lib_name + "/" + fp_name).lower()
+    return "testpoint" in blob or "test_point" in blob
+
+
+def _iter_signal_pads(board):
+    """Yield pads on the board, skipping any whose parent footprint is
+    a test point. Used by both the per-netcode index builder and the
+    in-line fallback walk in get_routed_lengths_mm so the two paths
+    stay consistent."""
+    for fp in board.GetFootprints():
+        if _is_test_point_footprint(fp):
+            continue
+        for pad in fp.Pads():
+            yield pad
+
+
 def _pad_identity(pad):
     """Identity tuple used to recognise 'identical loads' on a net.
     Two pads with the same (FPID, pin_number) are presumed to be the
@@ -204,11 +264,12 @@ def build_tracks_by_netcode(board):
 
 def build_pads_by_netcode(board):
     """One-pass index of {net_code: [pad, ...]}. Same motivation as
-    build_tracks_by_netcode."""
+    build_tracks_by_netcode. Test-point footprints are skipped — their
+    pads aren't signal endpoints and would otherwise turn every probed
+    trace into a fake T-junction."""
     by_code = defaultdict(list)
-    for fp in board.GetFootprints():
-        for pad in fp.Pads():
-            by_code[pad.GetNetCode()].append(pad)
+    for pad in _iter_signal_pads(board):
+        by_code[pad.GetNetCode()].append(pad)
     return by_code
 
 
@@ -309,42 +370,44 @@ def get_routed_lengths_mm(board, net_code,
         elif cls == "PCB_VIA":
             n_vias += 1
 
-    # Find all pads on the net.
+    # Find all pads on the net (skipping test-point footprints — see
+    # build_pads_by_netcode for rationale).
     if pads_for_net is None:
-        pads = []
-        for fp in board.GetFootprints():
-            for pad in fp.Pads():
-                if pad.GetNetCode() == net_code:
-                    pads.append(pad)
+        pads = [pad for pad in _iter_signal_pads(board)
+                if pad.GetNetCode() == net_code]
     else:
         pads = list(pads_for_net)
 
     if len(pads) < 2:
-        # Nothing to path-find between. long == short by definition.
+        # 0/1-pad fragment — no pad-to-pad path exists, no "short arm"
+        # concept either. Report long via the primitive total, short None.
         result = iu_to_mm(total_iu)
-        _llog("net={:4d} {!r:<32} <2pads tr={} arc={} via={} total={:.3f} -> fallback {:.3f}"
+        _llog("net={:4d} {!r:<32} <2pads tr={} arc={} via={} total={:.3f} -> fallback {:.3f} short=-"
               .format(net_code, net_name, n_tracks, n_arcs, n_vias,
                       iu_to_mm(total_iu), result))
-        return result, result
+        return result, None
 
     # Try the CONNECTIVITY_DATA-based path first.
     long_mm, short_mm, n_edges, method = _length_via_connectivity(
         board, net_code, pads, items_on_net)
     if long_mm is not None:
-        _llog("net={:4d} {!r:<32} tr={} arc={} via={} pads={} edges={} total={:.3f} -> CONN[{}] long={:.3f} short={:.3f}"
+        # 2-pad nets are point-to-point — there is no "short arm".
+        # Suppress the duplicate value so the column shows '-' and the
+        # intra-net skew check doesn't fire on a meaningless metric.
+        if len(pads) == 2:
+            short_mm = None
+        _llog("net={:4d} {!r:<32} tr={} arc={} via={} pads={} edges={} total={:.3f} -> CONN[{}] long={:.3f} short={}"
               .format(net_code, net_name, n_tracks, n_arcs, n_vias, len(pads),
                       n_edges, iu_to_mm(total_iu), method, long_mm,
-                      short_mm if short_mm is not None else -1.0))
-        if short_mm is None:
-            short_mm = long_mm
+                      "{:.3f}".format(short_mm) if short_mm is not None else "-"))
         return long_mm, short_mm
 
-    # Last-resort fallback. No topology info — short collapses to long.
+    # Last-resort fallback. No topology info — can't define a short arm.
     result = iu_to_mm(total_iu)
-    _llog("net={:4d} {!r:<32} tr={} arc={} via={} pads={} edges={} total={:.3f} -> CONN-FAIL[{}] fallback {:.3f}"
+    _llog("net={:4d} {!r:<32} tr={} arc={} via={} pads={} edges={} total={:.3f} -> CONN-FAIL[{}] fallback {:.3f} short=-"
           .format(net_code, net_name, n_tracks, n_arcs, n_vias, len(pads),
                   n_edges, iu_to_mm(total_iu), method, result))
-    return result, result
+    return result, None
 
 
 # One-shot flag so we only log the API probe once per session.
@@ -1579,7 +1642,7 @@ class LengthMonitorDialog(wx.Frame):
     def __init__(self, board):
         super(LengthMonitorDialog, self).__init__(
             None,
-            title="Length & Skew Constraint Monitor (v3.8 - short arm = source-relative)",
+            title="Length & Skew Constraint Monitor (v3.9 - P2P short='-', skip test-point pads)",
             size=(980, 520),
             style=wx.DEFAULT_FRAME_STYLE | wx.STAY_ON_TOP
         )
